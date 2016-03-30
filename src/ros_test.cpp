@@ -57,13 +57,13 @@ class Receiver{
     image_transport::ImageTransport it;
     image_transport::SubscriberFilter *subImageColor, *subImageDepth;
     message_filters::Subscriber<sensor_msgs::CameraInfo> *subCameraInfoColor, *subCameraInfoDepth;
-    message_filters::Synchronizer<ApproximateSyncPolicy> *syncApproximate;
+    message_filters::Synchronizer<ExactSyncPolicy> *syncExact;
 
     boost::thread get_image_thread;
     boost::thread process_thread;
 
     pcl::PointCloud<pcl::PointXYZRGBA>::Ptr cloud;
-    pcl::PCDWriter writer; 
+    pcl::PCDWriter writer;
 
     std::ostringstream oss;
     public:
@@ -113,8 +113,8 @@ class Receiver{
         cloud->height = color.rows;
         cloud->width = color.cols;
         cloud->is_dense = false;
-        cloud->points.resize(cloud->height * cloud->width); 
-        createLookup(this->color.cols, this->color.rows); 
+        cloud->points.resize(cloud->height * cloud->width);
+        createLookup(this->color.cols, this->color.rows);
 
         while(!getImage ||!updateCloud)
         {
@@ -125,14 +125,14 @@ class Receiver{
             boost::this_thread::sleep(boost::posix_time::milliseconds(1));
         }
 
-        get_image_thread = boost::thread(&Receiver::getImage, this);
+        get_image_thread = boost::thread(&Receiver::imageThread, this);
         cloudViewer();
     }
     void stop()
     {
         spinner.stop();
 
-        delete syncApproximate;
+        delete syncExact;
 
         delete subImageColor;
         delete subImageDepth;
@@ -168,7 +168,7 @@ class Receiver{
         lock.unlock();
     }
 
-    void getImage()
+    void imageThread()
     {
         cv::Mat color, depth, depthDisp, combined;
         double fps = 0;
@@ -185,12 +185,12 @@ class Receiver{
 
         for(; running && ros::ok();)
         {
-            if(updateImage)
+            if(getImage)
             {
                 lock.lock();
                 color = this->color;
                 depth = this->depth;
-                updateImage = false;
+                getImage = false;
                 lock.unlock();
             }
         }
@@ -214,11 +214,10 @@ class Receiver{
         visualizer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, cloudName);
         visualizer->initCameraParameters();
         visualizer->setBackgroundColor(0, 0, 0);
-        visualizer->setPosition(mode == BOTH ? color.cols : 0, 0);
+        visualizer->setPosition(0, 0);
         visualizer->setSize(color.cols, color.rows);
         visualizer->setShowFPS(true);
         visualizer->setCameraPosition(0, 0, 0, 0, -1, 0);
-        visualizer->registerKeyboardCallback(&Receiver::keyboardEvent, *this);
 
         for(; running && ros::ok();)
         {
@@ -260,7 +259,7 @@ class Receiver{
         {
             *it = (c - cx) * fx;
         }
-    } 
+    }
 
     void createCloud(const cv::Mat &depth, const cv::Mat &color, pcl::PointCloud<pcl::PointXYZRGBA>::Ptr &cloud) const
     {
