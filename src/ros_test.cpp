@@ -39,7 +39,6 @@ class Receiver{
     boost::mutex lock;
 
     const std::string topicColor, topicDepth;
-    bool getImage;
     bool updateCloud;
     bool running;
     size_t frame;
@@ -69,7 +68,7 @@ class Receiver{
     public:
 
     Receiver(const std::string &topicColor, const std::string &topicDepth)
-        :topicColor(topicColor), topicDepth(topicDepth), nh("~"), spinner(0), it(nh), getImage(false), updateCloud(false), running(false),frame(0){
+        :topicColor(topicColor), topicDepth(topicDepth), nh("~"), spinner(0), it(nh), updateCloud(false), running(false),frame(0){
             queueSize = 5;
             cameraMatrixColor = cv::Mat::zeros(3, 3, CV_64F);
             cameraMatrixDepth = cv::Mat::zeros(3, 3, CV_64F);
@@ -109,14 +108,7 @@ class Receiver{
 
         spinner.start();
 
-        cloud = pcl::PointCloud<pcl::PointXYZRGBA>::Ptr(new pcl::PointCloud<pcl::PointXYZRGBA>());
-        cloud->height = color.rows;
-        cloud->width = color.cols;
-        cloud->is_dense = false;
-        cloud->points.resize(cloud->height * cloud->width);
-        createLookup(this->color.cols, this->color.rows);
-
-        while(!getImage ||!updateCloud)
+        while(!updateCloud)
         {
             if(!ros::ok())
             {
@@ -125,7 +117,13 @@ class Receiver{
             boost::this_thread::sleep(boost::posix_time::milliseconds(1));
         }
 
-        get_image_thread = boost::thread(&Receiver::imageThread, this);
+        cloud = pcl::PointCloud<pcl::PointXYZRGBA>::Ptr(new pcl::PointCloud<pcl::PointXYZRGBA>());
+        cloud->height = color.rows;
+        cloud->width = color.cols;
+        cloud->is_dense = false;
+        cloud->points.resize(cloud->height * cloud->width);
+        createLookup(this->color.cols, this->color.rows);
+        cloud->points.resize(color.rows*color.cols);
         cloudViewer();
     }
     void stop()
@@ -138,7 +136,7 @@ class Receiver{
         delete subImageDepth;
         delete subCameraInfoColor;
         delete subCameraInfoDepth;
-        get_image_thread.join();
+      //  get_image_thread.join();
         running = false;
     }
     void callback(const sensor_msgs::Image::ConstPtr imageColor, const sensor_msgs::Image::ConstPtr imageDepth,
@@ -163,44 +161,17 @@ class Receiver{
         lock.lock();
         this->color = color;
         this->depth = depth;
-        getImage = true;
         updateCloud = true;
         lock.unlock();
     }
 
-    void imageThread()
-    {
-        cv::Mat color, depth, depthDisp, combined;
-        double fps = 0;
-        size_t frameCount = 0;
-        std::ostringstream oss;
-        const cv::Point pos(5, 15);
-        const cv::Scalar colorText = CV_RGB(255, 255, 255);
-        const double sizeText = 0.5;
-        const int lineText = 1;
-        const int font = cv::FONT_HERSHEY_SIMPLEX;
-
-        cv::namedWindow("Image Viewer");
-        oss << "starting...";
-
-        for(; running && ros::ok();)
-        {
-            if(getImage)
-            {
-                lock.lock();
-                color = this->color;
-                depth = this->depth;
-                getImage = false;
-                lock.unlock();
-            }
-        }
-    }
 
     void cloudViewer()
     {
         cv::Mat color, depth;
         pcl::visualization::PCLVisualizer::Ptr visualizer(new pcl::visualization::PCLVisualizer("Cloud Viewer"));
         const std::string cloudName = "rendered";
+
 
         lock.lock();
         color = this->color;
@@ -229,8 +200,14 @@ class Receiver{
                 updateCloud = false;
                 lock.unlock();
 
-                createCloud(depth, color, cloud);
+                pcl::PointCloud<pcl::PointXYZRGBA>::Ptr new_cloud = pcl::PointCloud<pcl::PointXYZRGBA>::Ptr(new pcl::PointCloud<pcl::PointXYZRGBA>());
+                new_cloud->height = color.rows;
+                new_cloud->width = color.cols;
+                new_cloud->is_dense = false;
+                new_cloud->points.resize(color.rows * color.cols);
 
+                createCloud(depth, color, new_cloud);
+                cloud->swap(*new_cloud);
                 visualizer->updatePointCloud(cloud, cloudName);
             }
             visualizer->spinOnce(10);
@@ -268,14 +245,15 @@ class Receiver{
 #pragma omp parallel for
         for(int r = 0; r < depth.rows; ++r)
         {
-            pcl::PointXYZRGBA *itP = &cloud->points[r * depth.cols];
+            pcl::PointXYZRGBA *itP = &cloud->points[r*depth.cols];
             const uint16_t *itD = depth.ptr<uint16_t>(r);
             const cv::Vec3b *itC = color.ptr<cv::Vec3b>(r);
             const float y = lookupY.at<float>(0, r);
             const float *itX = lookupX.ptr<float>();
-
-            for(size_t c = 0; c < (size_t)depth.cols; ++c, ++itP, ++itD, ++itC, ++itX)
+            for(size_t c = 0; c < (size_t)depth.cols; ++c,++itD, ++itP, ++itC, ++itX)
             {
+                //pcl::PointXYZRGBA itP;
+
                 register const float depthValue = *itD / 1000.0f;
                 // Check for invalid measurements
                 if(*itD == 0)
@@ -292,8 +270,11 @@ class Receiver{
                 itP->g = itC->val[1];
                 itP->r = itC->val[2];
                 itP->a = 255;
+                //OUT_INFO("z,x,y,b,g,r " <<itP.z<<" "<<itP.x<<" "<<itP.y<<" "<<itP.b<<" "<<itP.g<<" "<<itP.r<<" ");
+                //new_cloud->points.push_back(itP);
             }
         }
+        //cloud->swap(*new_cloud);
     }
 
     void readImage(const sensor_msgs::Image::ConstPtr msgImage, cv::Mat &image) const
