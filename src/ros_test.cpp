@@ -10,13 +10,23 @@
 #include <boost/thread/thread.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
-
+#include <eigen3/Eigen/Eigen>
+#include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/eigen.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/features2d/features2d.hpp>
+#include <opencv2/nonfree/nonfree.hpp>
+#include <opencv2/calib3d/calib3d.hpp>
+
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/visualization/cloud_viewer.h>
+#include <pcl/common/transforms.h>
+#include <pcl/filters/voxel_grid.h>
 
 #include <ros/ros.h>
 #include <ros/spinner.h>
@@ -41,15 +51,30 @@ class Receiver{
     const std::string topicColor, topicDepth;
     bool updateCloud;
     bool running;
+    bool imageReady;
+    bool updated;
     size_t frame;
     unsigned int queueSize;
 
     cv::Mat color, depth;
     cv::Mat cameraMatrixColor, cameraMatrixDepth;
     cv::Mat lookupX, lookupY;
+    cv::Ptr<cv::FeatureDetector> detector;
+    cv::Ptr<cv::DescriptorExtractor> descriptor;
+    cv::Ptr<cv::DescriptorMatcher> matcher;
+    
+
+    struct frame_t{
+      cv::Mat desp;
+      std::vector<cv::KeyPoint> kps;
+      cv::Mat depth;
+    };
+    
+    Eigen::Isometry3d T;
+
 
     typedef message_filters::sync_policies::ExactTime<sensor_msgs::Image, sensor_msgs::Image, sensor_msgs::CameraInfo, sensor_msgs::CameraInfo> ExactSyncPolicy;
-
+    std::vector<frame_t*> frames;
     std::vector<int> params;
     ros::NodeHandle nh;
     ros::AsyncSpinner spinner;
@@ -68,7 +93,10 @@ class Receiver{
     public:
 
     Receiver(const std::string &topicColor, const std::string &topicDepth)
-        :topicColor(topicColor), topicDepth(topicDepth), nh("~"), spinner(0), it(nh), updateCloud(false), running(false),frame(0){
+        :topicColor(topicColor), topicDepth(topicDepth),updateCloud(false),running(false),imageReady(false),updated(true),frame(0),nh("~"), spinner(0), it(nh){
+            detector = cv::FeatureDetector::create("SIFT");
+            descriptor = cv::DescriptorExtractor::create("SIFT");
+            matcher = cv::DescriptorMatcher::create("FlannBased");
             queueSize = 5;
             cameraMatrixColor = cv::Mat::zeros(3, 3, CV_64F);
             cameraMatrixDepth = cv::Mat::zeros(3, 3, CV_64F);
@@ -107,8 +135,7 @@ class Receiver{
         syncExact->registerCallback(boost::bind(&Receiver::callback, this, _1, _2, _3, _4));
 
         spinner.start();
-
-        while(!updateCloud)
+        while(!imageReady)
         {
             if(!ros::ok())
             {
@@ -124,6 +151,7 @@ class Receiver{
         cloud->points.resize(cloud->height * cloud->width);
         createLookup(this->color.cols, this->color.rows);
         cloud->points.resize(color.rows*color.cols);
+        process_thread = boost::thread(&Receiver::process, this);
         cloudViewer();
     }
     void stop()
@@ -142,8 +170,10 @@ class Receiver{
     void callback(const sensor_msgs::Image::ConstPtr imageColor, const sensor_msgs::Image::ConstPtr imageDepth,
             const sensor_msgs::CameraInfo::ConstPtr cameraInfoColor, const sensor_msgs::CameraInfo::ConstPtr cameraInfoDepth)
     {
+        if(!updated){
+            return;
+        }
         cv::Mat color, depth;
-
         readCameraInfo(cameraInfoColor, cameraMatrixColor);
         readCameraInfo(cameraInfoDepth, cameraMatrixDepth);
         readImage(imageColor, color);
@@ -157,14 +187,113 @@ class Receiver{
             color.convertTo(tmp, CV_8U, 0.02);
             cv::cvtColor(tmp, color, CV_GRAY2BGR);
         }
-
         lock.lock();
         this->color = color;
         this->depth = depth;
-        updateCloud = true;
+        imageReady = true;
         lock.unlock();
-    }
 
+    }
+    
+    void process()
+    {
+        OUT_INFO("ready for process");
+        for(; running && ros::ok();)
+        {
+            if(!imageReady){
+                continue;
+            }
+            cv::Mat color, depth;
+            lock.lock();
+            color = this->color;
+            depth = this->depth;
+            imageReady = false;
+            frame_t *frame = new frame_t;
+            lock.unlock();
+            cv::imshow("Image Viewer",color);
+            //int key = cv::waitKey(0);
+
+            /*if ((key&0xff) == 's' ){
+              OUT_INFO("Start processing");
+            }else{
+              OUT_INFO("Skip this frame");
+              continue;
+            }*/
+            //get feature of new frame
+            detector->detect(color,frame->kps);
+            descriptor->compute(color,frame->kps,frame->desp);
+            frame->depth = depth;
+            if(frames.size() == 0){
+                frames.push_back(frame);
+                OUT_INFO("Initialize first frame!");
+                continue;
+            }
+            
+            std::vector<cv::DMatch> matches;
+            matcher->match(frames.back()->desp,frame->desp,matches);
+            std::vector<cv::DMatch> good_matches;
+            double min_dist = std::numeric_limits<double>::max();
+            for (size_t i = 0;i<matches.size();++i){
+                if(matches[i].distance < min_dist){
+                    min_dist = matches[i].distance;
+                }
+            }
+            min_dist = 4*min_dist;
+            for (size_t i = 0;i<matches.size();++i){
+                if(matches[i].distance < min_dist){
+                    good_matches.push_back(matches[i]);          
+                }
+            }
+
+            if (good_matches.size() < 10){
+                OUT_INFO("Can not find enough matches to do RANSAC");
+                continue;
+            }
+            frame_t *f1 = frames.back();
+            frame_t *f2 = frame;
+
+            std::vector<cv::Point3f> pts_obj;
+            std::vector<cv::Point2f> pts_img;
+            const float fx = 1.0f / cameraMatrixColor.at<double>(0, 0);
+            const float fy = 1.0f / cameraMatrixColor.at<double>(1, 1);
+            const float cx = cameraMatrixColor.at<double>(0, 2);
+            const float cy = cameraMatrixColor.at<double>(1, 2);
+            for (size_t i = 0; i < good_matches.size(); ++i) {
+                cv::Point2f p = f1->kps[good_matches[i].queryIdx].pt;
+                ushort d = f1->depth.ptr<ushort>(int(p.y))[int(p.x)];
+                if(d == 0){
+                    continue;
+                }
+                pts_img.push_back(cv::Point2f(f2->kps[good_matches[i].trainIdx].pt));
+                cv::Point3f pt(p.x, p.y, d);
+                cv::Point3f pd;
+                pd.z = double(pt.z) / 1000.0;
+                pd.x = (pt.x - cx)*pd.z / fx;
+                pd.y = (pt.y - cy)*pd.z / fy;
+                pts_obj.push_back(pd);
+            }
+            if(pts_obj.size() < 5 || pts_img.size() < 5){
+                std::cout<<"too little pts_obj size: "<<pts_obj.size()<<std::endl;
+                continue;
+            }
+            cv::Mat rvec, tvec, inliers;
+            cv::solvePnPRansac( pts_obj, pts_img, cameraMatrixColor, cv::Mat(), rvec, tvec, false, 100, 1.0, 100, inliers );
+            cv::Mat R;
+            cv::Rodrigues(rvec, R);
+            Eigen::Matrix3d r;
+            cv::cv2eigen(R, r);
+            Eigen::AngleAxisd angle(r);
+            lock.lock();
+            T = Eigen::Isometry3d::Identity();
+            T = angle;
+            T(0,3) = tvec.at<double>(0,0); 
+            T(1,3) = tvec.at<double>(0,1); 
+            T(2,3) = tvec.at<double>(0,2);
+            updateCloud = true;
+            lock.unlock();
+            frames.push_back(frame);
+        }
+    }
 
     void cloudViewer()
     {
@@ -185,10 +314,11 @@ class Receiver{
         visualizer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, cloudName);
         visualizer->initCameraParameters();
         visualizer->setBackgroundColor(0, 0, 0);
-        visualizer->setPosition(0, 0);
-        visualizer->setSize(color.cols, color.rows);
-        visualizer->setShowFPS(true);
+        //visualizer->setPosition(0, 0);
+        //visualizer->setSize(color.cols, color.rows);
+        //visualizer->setShowFPS(true);
         visualizer->setCameraPosition(0, 0, 0, 0, -1, 0);
+        visualizer->registerKeyboardCallback(&Receiver::keyboardEvent, *this);
 
         for(; running && ros::ok();)
         {
@@ -199,21 +329,63 @@ class Receiver{
                 depth = this->depth;
                 updateCloud = false;
                 lock.unlock();
+                pcl::PointCloud<pcl::PointXYZRGBA>::Ptr output = pcl::PointCloud<pcl::PointXYZRGBA>::Ptr(new pcl::PointCloud<pcl::PointXYZRGBA>());
 
+                //create cloud
                 pcl::PointCloud<pcl::PointXYZRGBA>::Ptr new_cloud = pcl::PointCloud<pcl::PointXYZRGBA>::Ptr(new pcl::PointCloud<pcl::PointXYZRGBA>());
                 new_cloud->height = color.rows;
                 new_cloud->width = color.cols;
                 new_cloud->is_dense = false;
                 new_cloud->points.resize(color.rows * color.cols);
-
                 createCloud(depth, color, new_cloud);
+                bool init = frames.size() == 1 ? true:false;
+                if(!init){
+                    pcl::transformPointCloud(*cloud, *output, T.matrix());
+                }
+                OUT_INFO("before cloud size:"<<cloud->points.size());
+                *new_cloud += *output;
+
+                if(!init){
+                    static pcl::VoxelGrid<pcl::PointXYZRGBA> voxel;
+                    double gridsize = 0.01;
+                    voxel.setLeafSize(gridsize, gridsize, gridsize);
+                    voxel.setInputCloud(new_cloud);
+                    pcl::PointCloud<pcl::PointXYZRGBA>::Ptr tmp  = pcl::PointCloud<pcl::PointXYZRGBA>::Ptr(new pcl::PointCloud<pcl::PointXYZRGBA>());
+                    voxel.filter(*tmp);
+                    cloud->swap(*tmp);
+                }
+                else{
+                    cloud->swap(*new_cloud);
+                }
                 cloud->swap(*new_cloud);
+                OUT_INFO("after cloud size:"<<cloud->points.size());
                 visualizer->updatePointCloud(cloud, cloudName);
             }
             visualizer->spinOnce(10);
+            //pcl::io::savePCDFileASCII ("test_pcd.pcd", *cloud);
         }
         visualizer->close();
     }
+
+void keyboardEvent(const pcl::visualization::KeyboardEvent &event, void *)
+  {
+    if(event.keyUp())
+    {
+      switch(event.getKeyCode())
+      {
+      case 27:
+      case 'q':
+        running = false;
+        break;
+      case ' ':
+      case 's':
+        pcl::io::savePCDFileASCII ("test_pcd.pcd", *cloud);
+        OUT_INFO("Saved " << cloud->points.size () << " data points to test_pcd.pcd.");
+        break;
+      }
+    }
+  }
+
 
     void createLookup(size_t width, size_t height)
     {
@@ -317,6 +489,7 @@ class Receiver{
 
 int main(int argc, char **argv)
 {
+    cv::initModule_nonfree();
 #if EXTENDED_OUTPUT
     ROSCONSOLE_AUTOINIT;
     if(!getenv("ROSCONSOLE_FORMAT"))
