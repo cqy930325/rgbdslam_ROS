@@ -10,6 +10,7 @@
 #include <boost/thread/thread.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
+
 #include <eigen3/Eigen/Eigen>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -19,7 +20,6 @@
 #include <opencv2/features2d/features2d.hpp>
 #include <opencv2/nonfree/nonfree.hpp>
 #include <opencv2/calib3d/calib3d.hpp>
-
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -38,6 +38,7 @@
 #include <image_transport/image_transport.h>
 #include <image_transport/subscriber_filter.h>
 
+#include <pcl_ros/points_cloud.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/exact_time.h>
@@ -78,6 +79,7 @@ class Receiver{
     std::vector<int> params;
     ros::NodeHandle nh;
     ros::AsyncSpinner spinner;
+    ros::Publisher pub;
     image_transport::ImageTransport it;
     image_transport::SubscriberFilter *subImageColor, *subImageDepth;
     message_filters::Subscriber<sensor_msgs::CameraInfo> *subCameraInfoColor, *subCameraInfoDepth;
@@ -94,6 +96,7 @@ class Receiver{
 
     Receiver(const std::string &topicColor, const std::string &topicDepth)
         :topicColor(topicColor), topicDepth(topicDepth),updateCloud(false),running(false),imageReady(false),updated(true),frame(0),nh("~"), spinner(0), it(nh){
+            pub = nh.advertise<pcl::PointCloud<pcl::PointXYZRGBA>> ("rendered", 1);
             detector = cv::FeatureDetector::create("SIFT");
             descriptor = cv::DescriptorExtractor::create("SIFT");
             matcher = cv::DescriptorMatcher::create("FlannBased");
@@ -154,6 +157,7 @@ class Receiver{
         process_thread = boost::thread(&Receiver::process, this);
         cloudViewer();
     }
+
     void stop()
     {
         spinner.stop();
@@ -298,7 +302,7 @@ class Receiver{
     void cloudViewer()
     {
         cv::Mat color, depth;
-        pcl::visualization::PCLVisualizer::Ptr visualizer(new pcl::visualization::PCLVisualizer("Cloud Viewer"));
+        //pcl::visualization::PCLVisualizer::Ptr visualizer(new pcl::visualization::PCLVisualizer("Cloud Viewer"));
         const std::string cloudName = "rendered";
 
 
@@ -310,15 +314,15 @@ class Receiver{
 
         createCloud(depth, color, cloud);
 
-        visualizer->addPointCloud(cloud, cloudName);
-        visualizer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, cloudName);
-        visualizer->initCameraParameters();
-        visualizer->setBackgroundColor(0, 0, 0);
+        //visualizer->addPointCloud(cloud, cloudName);
+        //visualizer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, cloudName);
+        //visualizer->initCameraParameters();
+        //visualizer->setBackgroundColor(0, 0, 0);
         //visualizer->setPosition(0, 0);
         //visualizer->setSize(color.cols, color.rows);
         //visualizer->setShowFPS(true);
-        visualizer->setCameraPosition(0, 0, 0, 0, -1, 0);
-        visualizer->registerKeyboardCallback(&Receiver::keyboardEvent, *this);
+        //visualizer->setCameraPosition(0, 0, 0, 0, -1, 0);
+        //visualizer->registerKeyboardCallback(&Receiver::keyboardEvent, *this);
 
         for(; running && ros::ok();)
         {
@@ -352,19 +356,25 @@ class Receiver{
                     voxel.setInputCloud(new_cloud);
                     pcl::PointCloud<pcl::PointXYZRGBA>::Ptr tmp  = pcl::PointCloud<pcl::PointXYZRGBA>::Ptr(new pcl::PointCloud<pcl::PointXYZRGBA>());
                     voxel.filter(*tmp);
+                    lock.lock();
                     cloud->swap(*tmp);
+                    lock.unlock();
                 }
                 else{
+                    lock.lock();
                     cloud->swap(*new_cloud);
+                    lock.unlock();
                 }
-                cloud->swap(*new_cloud);
                 OUT_INFO("after cloud size:"<<cloud->points.size());
-                visualizer->updatePointCloud(cloud, cloudName);
+                lock.lock();
+                pub.publish(cloud);
+                lock.unlock();
+                //visualizer->updatePointCloud(cloud, cloudName);
             }
-            visualizer->spinOnce(10);
+            //visualizer->spinOnce(10);
             //pcl::io::savePCDFileASCII ("test_pcd.pcd", *cloud);
         }
-        visualizer->close();
+        //visualizer->close();
     }
 
 void keyboardEvent(const pcl::visualization::KeyboardEvent &event, void *)
