@@ -38,7 +38,7 @@
 #include <image_transport/image_transport.h>
 #include <image_transport/subscriber_filter.h>
 
-#include <pcl_ros/points_cloud.h>
+#include <pcl_ros/point_cloud.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/exact_time.h>
@@ -47,6 +47,7 @@
 #include <kinect2_bridge/kinect2_definitions.h>
 
 class Receiver{
+public:
     boost::mutex lock;
 
     const std::string topicColor, topicDepth;
@@ -79,7 +80,7 @@ class Receiver{
     std::vector<int> params;
     ros::NodeHandle nh;
     ros::AsyncSpinner spinner;
-    ros::Publisher pub;
+    //ros::Publisher pub;
     image_transport::ImageTransport it;
     image_transport::SubscriberFilter *subImageColor, *subImageDepth;
     message_filters::Subscriber<sensor_msgs::CameraInfo> *subCameraInfoColor, *subCameraInfoDepth;
@@ -96,7 +97,7 @@ class Receiver{
 
     Receiver(const std::string &topicColor, const std::string &topicDepth)
         :topicColor(topicColor), topicDepth(topicDepth),updateCloud(false),running(false),imageReady(false),updated(true),frame(0),nh("~"), spinner(0), it(nh){
-            pub = nh.advertise<pcl::PointCloud<pcl::PointXYZRGBA>> ("rendered", 1);
+            //pub = nh.advertise<pcl::PointCloud<pcl::PointXYZRGBA>> ("points2", 1);
             detector = cv::FeatureDetector::create("SIFT");
             descriptor = cv::DescriptorExtractor::create("SIFT");
             matcher = cv::DescriptorMatcher::create("FlannBased");
@@ -215,14 +216,14 @@ class Receiver{
             frame_t *frame = new frame_t;
             lock.unlock();
             cv::imshow("Image Viewer",color);
-            //int key = cv::waitKey(0);
+            int key = cv::waitKey(0);
 
-            /*if ((key&0xff) == 's' ){
+            if ((key&0xff) == 's' ){
               OUT_INFO("Start processing");
             }else{
               OUT_INFO("Skip this frame");
               continue;
-            }*/
+            }
             //get feature of new frame
             detector->detect(color,frame->kps);
             descriptor->compute(color,frame->kps,frame->desp);
@@ -304,8 +305,8 @@ class Receiver{
         cv::Mat color, depth;
         //pcl::visualization::PCLVisualizer::Ptr visualizer(new pcl::visualization::PCLVisualizer("Cloud Viewer"));
         const std::string cloudName = "rendered";
-
-
+        pcl::visualization::PCLVisualizer viz;
+        viz.addPointCloud(cloud, cloudName);
         lock.lock();
         color = this->color;
         depth = this->depth;
@@ -323,6 +324,11 @@ class Receiver{
         //visualizer->setShowFPS(true);
         //visualizer->setCameraPosition(0, 0, 0, 0, -1, 0);
         //visualizer->registerKeyboardCallback(&Receiver::keyboardEvent, *this);
+
+        viz.initCameraParameters();
+        viz.setBackgroundColor(0,0,0);
+        viz.setPosition(0, 0);
+        viz.setCameraPosition(0, 0, 0, 0, -1, 0);
 
         for(; running && ros::ok();)
         {
@@ -367,10 +373,11 @@ class Receiver{
                 }
                 OUT_INFO("after cloud size:"<<cloud->points.size());
                 lock.lock();
-                pub.publish(cloud);
+                viz.updatePointCloud(cloud, cloudName);
                 lock.unlock();
                 //visualizer->updatePointCloud(cloud, cloudName);
             }
+            viz.spinOnce(100);
             //visualizer->spinOnce(10);
             //pcl::io::savePCDFileASCII ("test_pcd.pcd", *cloud);
         }
@@ -531,7 +538,6 @@ int main(int argc, char **argv)
     OUT_INFO("topic depth: " FG_CYAN << topicDepth << NO_COLOR);
 
     Receiver receiver(topicColor, topicDepth);
-
     OUT_INFO("starting receiver...");
     receiver.run();
 
